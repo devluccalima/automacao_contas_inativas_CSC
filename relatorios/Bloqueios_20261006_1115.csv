@@ -1,0 +1,4 @@
+﻿Email;Tipo_Caixa;Acao;Resultado;Detalhe;Data_Acao
+mariana.lais@paulooctavio.com.br;SharedMailbox;Bloquear login;BLOQUEADA;;06/10/2026 11:14
+marcelo.junior@cscpaulooctavio.com.br;UserMailbox;Bloquear login;ERRO;"{""error"":{""code"":""Authorization_RequestDenied"",""message"":""Insufficient privileges to complete the operation."",""innerError"":{""date"":""2026-10-06T14:15:00"",""request-id"":""ac8426c6-0038-4df8-8dae-7dc57bd4d0ef"",""client-request-id"":""ac8426c6-0038-4df8-8dae-7dc57bd4d0ef""}}}";06/10/2026 11:15
+luiz.santos@paulooctavio.com.br;UserMailbox;Bloquear login;BLOQUEADA;;06/10/2026 11:15
