@@ -1,3 +1,5 @@
 .env
 relatorios/
 __pycache__/
+whitelist.csv
+tipos_caixa_exchange.csv
