@@ -11,6 +11,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 
 import pandas as pd
 import requests
@@ -19,6 +20,7 @@ from core.bloqueio_login import (
     GRAPH, _headers, _resultado, bloquear_conta,
     COL_EMAIL, COL_TIPO, COL_CLASSIFICACAO, CLASSIFICACAO_ALVO, COL_DIAS,
     TIPOS_ELEGIVEIS, DIAS_NUNCA_ACESSADA, MAX_ERROS_SEGUIDOS,
+    COL_ESTAGIO, ESTAGIO_BLOQUEAR, ESTAGIO_COMPLETO,
 )
 
 log = logging.getLogger(__name__)
@@ -78,21 +80,38 @@ def _rodar_powershell(emails, somente_verificar):
     return {str(d["Email"]).lower(): d for d in dados}
 
 
-def _remover_licencas(token, email):
-    """Remove as licenças atribuídas DIRETAMENTE. Retorna (removidas, herdadas_de_grupo).
-    Licenças herdadas de grupo não podem ser removidas por aqui (é preciso tirar a conta do grupo)."""
-    h = _headers(token)
-    r = requests.get(f"{GRAPH}/users/{email}", headers=h,
+def _licencas_do_usuario(token, email):
+    """Lê do Entra ID as licenças do usuário. Retorna (diretas, herdadas_de_grupo) como listas de skuId."""
+    r = requests.get(f"{GRAPH}/users/{email}", headers=_headers(token),
                      params={"$select": "licenseAssignmentStates"}, timeout=30)
     r.raise_for_status()
     estados = r.json().get("licenseAssignmentStates", [])
     diretas = sorted({e["skuId"] for e in estados if not e.get("assignedByGroup")})
     herdadas = sorted({e["skuId"] for e in estados if e.get("assignedByGroup")})
-    if diretas:
-        r = requests.post(f"{GRAPH}/users/{email}/assignLicense", headers=h,
-                          json={"addLicenses": [], "removeLicenses": diretas}, timeout=30)
-        r.raise_for_status()
-    return len(diretas), len(herdadas)
+    return diretas, herdadas
+
+
+def _remover_licencas(token, email, tentativas=6, espera=5):
+    """Remove as licenças atribuídas DIRETAMENTE e CONFIRMA a remoção relendo o usuário
+    (o Entra ID pode levar alguns segundos para refletir a mudança).
+    Retorna (removidas, herdadas_de_grupo, confirmada).
+    Licenças herdadas de grupo não podem ser removidas por aqui (é preciso tirar a conta do grupo)."""
+    diretas, herdadas = _licencas_do_usuario(token, email)
+    if not diretas:
+        return 0, len(herdadas), True
+
+    r = requests.post(f"{GRAPH}/users/{email}/assignLicense", headers=_headers(token),
+                      json={"addLicenses": [], "removeLicenses": diretas}, timeout=30)
+    r.raise_for_status()
+
+    confirmada = False
+    for _ in range(tentativas):
+        restantes, herdadas = _licencas_do_usuario(token, email)
+        if not restantes:
+            confirmada = True
+            break
+        time.sleep(espera)
+    return len(diretas), len(herdadas), confirmada
 
 
 def _status_parcial(convertida, bloqueou_agora, removidas):
@@ -120,18 +139,26 @@ def _finalizar(token, email, tipo, bloqueou_agora, d, dry_run):
             return _resultado(email, tipo, acao, "SIMULADO", "Passaria por todas as etapas e a licença seria removida")
         return _resultado(email, tipo, acao, "SIMULADO", f"Licença seria MANTIDA: {motivos}")
 
+    # Trava final: a licença só pode sair se a caixa estiver CONFIRMADAMENTE compartilhada
+    if d.get("TipoFinal") != "SharedMailbox":
+        return _resultado(email, tipo, acao, "ERRO",
+                          f"[conversão] tipo atual da caixa: {d.get('TipoFinal')}; licença NÃO removida")
+
     if not pode:
         return _resultado(email, tipo, acao, _status_parcial(convertida, bloqueou_agora, 0),
                           f"Licença mantida: {motivos}")
 
     try:
-        removidas, herdadas = _remover_licencas(token, email)
+        removidas, herdadas, confirmada = _remover_licencas(token, email)
     except requests.HTTPError as e:
         corpo = e.response.text[:300] if e.response is not None else str(e)
         return _resultado(email, tipo, acao, "ERRO", f"[remover licença] {corpo}")
     except Exception as e:  # noqa: BLE001
         return _resultado(email, tipo, acao, "ERRO", f"[remover licença] {e}")
 
+    if removidas and not confirmada:
+        return _resultado(email, tipo, acao, _status_parcial(convertida, bloqueou_agora, removidas),
+                          "Remoção da licença solicitada, mas ainda não confirmada no Entra ID: confira em Licenças")
     if herdadas:
         return _resultado(email, tipo, acao, _status_parcial(convertida, bloqueou_agora, removidas),
                           "Licença herdada de grupo: remova a conta do grupo de licenciamento "
@@ -146,7 +173,15 @@ def _processar_chunk(token, chunk, dry_run):
     saida, seguem = [], {}
 
     # Passo 1: bloquear login (aqui NUNCA remove licença)
-    for email, tipo in chunk:
+    for email, tipo, estagio in chunk:
+        # Estágio BLOQUEAR: abaixo do limite de conversão, só bloqueia o login (não converte, não mexe na licença)
+        if estagio != ESTAGIO_COMPLETO:
+            if dry_run:
+                saida.append(_resultado(email, tipo, "Bloquear login", "SIMULADO",
+                                        "Só bloquear o login (abaixo do limite de conversão)"))
+            else:
+                saida.append(bloquear_conta(token, email, tipo, dry_run=False, remover_licenca=False))
+            continue
         if dry_run:
             seguem[email] = (tipo, False)
             continue
@@ -189,7 +224,10 @@ def processar_fase2(token, df, dry_run=True, limite_max=30, lote=None, permitir_
         )
 
     alvo = alvo.sort_values(COL_DIAS, ascending=False)
-    pendentes = [(r[COL_EMAIL], r[COL_TIPO]) for _, r in alvo.iterrows()]
+    # Sem a coluna Estagio (ou com valor diferente de CICLO COMPLETO), o padrão conservador é só bloquear
+    pendentes = [(r[COL_EMAIL], r[COL_TIPO],
+                  ESTAGIO_COMPLETO if r.get(COL_ESTAGIO) == ESTAGIO_COMPLETO else ESTAGIO_BLOQUEAR)
+                 for _, r in alvo.iterrows()]
 
     resultados, alteradas, erros_seguidos = [], 0, 0
     # Processa em blocos; contas que não alteram nada (PULADA/ERRO) não gastam o lote

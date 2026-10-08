@@ -15,8 +15,13 @@ LICENCAS_SEM_CUSTO = {
 
 NUNCA_ACESSADA = 999  # valor usado quando não há Last Activity Date
 DIAS_CONTA_RECENTE = 15  # conta criada há até N dias e sem acesso ainda é considerada recente
-DIAS_LIMITE_USUARIO = 60        # UserMailbox com licença paga: candidata a bloqueio acima disso
-DIAS_LIMITE_COMPARTILHADA = 90  # SharedMailbox com licença paga: candidata a bloqueio acima disso
+# Escalonamento por dias de inatividade (contas com licença paga):
+DIAS_BLOQUEIO_USUARIO = 20         # UserMailbox acima disso: candidata, estágio BLOQUEAR (só bloqueia o login)
+DIAS_CONVERSAO_USUARIO = 45        # UserMailbox acima disso: estágio CICLO COMPLETO (bloquear -> converter -> remover licença)
+DIAS_CONVERSAO_COMPARTILHADA = 45  # SharedMailbox acima disso: candidata direto no CICLO COMPLETO (já é compartilhada)
+
+# True: o CSV traz só o que exige atenção (candidatas e revisão manual). False: traz todas as contas.
+CSV_SOMENTE_PENDENCIAS = True
 
 
 def tem_licenca_paga(licencas):
@@ -26,7 +31,7 @@ def tem_licenca_paga(licencas):
     return any(i not in LICENCAS_SEM_CUSTO for i in itens)
 
 
-def gerar_relatorio_inativos(lista_relatorio_unificado, datas_criacao=None):
+def gerar_relatorio_inativos(lista_relatorio_unificado, dados_entra=None):
     print("\nProcessando Relatório Unificado e cruzando com o Exchange...")
 
     # 1. Tratamento do Relatório Único (Graph API)
@@ -57,10 +62,13 @@ def gerar_relatorio_inativos(lista_relatorio_unificado, datas_criacao=None):
     # 3. Cruzamento
     df_final = pd.merge(df_atividade, df_exchange, on='Email', how='left')
 
-    # 3.1 Data de criação da conta (Entra ID): ajuda a separar conta recém-criada de conta antiga nunca usada
+    # 3.1 Dados do Entra ID: data de criação (separa conta recém-criada de conta antiga nunca usada)
+    #     e se o login está ativo (evita trazer de novo contas que já foram bloqueadas)
+    dados = dados_entra or {}
     df_final['Data_Criacao'] = pd.to_datetime(
-        df_final['Email'].map(datas_criacao or {}), errors='coerce', utc=True
+        df_final['Email'].map(lambda e: (dados.get(e) or {}).get('criada_em')), errors='coerce', utc=True
     ).dt.tz_localize(None).dt.normalize()
+    df_final['Login_Ativo'] = df_final['Email'].map(lambda e: (dados.get(e) or {}).get('login_ativo'))
 
     # 4. Whitelist
     caminho_whitelist = 'config/whitelist.csv'
@@ -94,7 +102,7 @@ def gerar_relatorio_inativos(lista_relatorio_unificado, datas_criacao=None):
         if tipo_caixa not in ('sharedmailbox', 'usermailbox'):
             return 'REVISAR (TIPO DESCONHECIDO)'
 
-        limite = DIAS_LIMITE_COMPARTILHADA if tipo_caixa == 'sharedmailbox' else DIAS_LIMITE_USUARIO
+        limite = DIAS_CONVERSAO_COMPARTILHADA if tipo_caixa == 'sharedmailbox' else DIAS_BLOQUEIO_USUARIO
 
         # Sem nenhuma atividade registrada: a data de criação separa a conta recém-criada (ainda não
         # deu tempo de usar) da conta antiga. A antiga continua em revisão manual, pois o relatório
@@ -109,6 +117,23 @@ def gerar_relatorio_inativos(lista_relatorio_unificado, datas_criacao=None):
 
     df_final['Classificacao'] = df_final.apply(classificar_conta, axis=1)
 
+    # Estágio de cada candidata: só bloquear o login, ou ciclo completo (bloquear -> converter -> remover licença)
+    def definir_estagio(row):
+        if row['Classificacao'] != 'CANDIDATA A BLOQUEIO':
+            return ''
+        compartilhada = str(row['Tipo_Caixa']).strip().lower() == 'sharedmailbox'
+        limite_completo = DIAS_CONVERSAO_COMPARTILHADA if compartilhada else DIAS_CONVERSAO_USUARIO
+        return 'CICLO COMPLETO' if row['Dias_Inativa'] > limite_completo else 'BLOQUEAR'
+
+    df_final['Estagio'] = df_final.apply(definir_estagio, axis=1)
+
+    # Já bloqueada e ainda dentro do prazo de conversão: não há nada a fazer agora (não é pendência)
+    ja_bloqueada = ((df_final['Classificacao'] == 'CANDIDATA A BLOQUEIO')
+                    & (df_final['Estagio'] == 'BLOQUEAR')
+                    & df_final['Login_Ativo'].eq(False))
+    df_final.loc[ja_bloqueada, 'Classificacao'] = 'BLOQUEADA (AGUARDANDO CONVERSÃO)'
+    df_final.loc[ja_bloqueada, 'Estagio'] = ''
+
     # Limpeza
     qtd_ignoradas = len(df_final[df_final['Classificacao'] == 'IGNORAR'])
     print(f"🧹 Contas de sistema e contas sem licença paga ocultadas: {qtd_ignoradas}")
@@ -120,15 +145,24 @@ def gerar_relatorio_inativos(lista_relatorio_unificado, datas_criacao=None):
     df_final['Data_Criacao'] = df_final['Data_Criacao'].dt.strftime('%d/%m/%Y').fillna('Desconhecida')
     df_final['Dias_Desde_Criacao'] = df_final['Dias_Desde_Criacao'].astype('Int64')
     df_final['Na_Whitelist'] = df_final['Email'].apply(lambda x: 'Sim' if x in lista_whitelist else 'Não')
+    df_final['Login_Ativo'] = df_final['Login_Ativo'].map({True: 'Sim', False: 'Não'}).fillna('Desconhecido')
     df_final['Tipo_Caixa'] = df_final['Tipo_Caixa'].fillna('Desconhecido')
 
     df_final = df_final[['Email', 'Nome', 'Tipo_Caixa', 'Licenças', 'Data_Criacao', 'Dias_Desde_Criacao',
-                         'Ultima_Atividade', 'Dias_Inativa', 'Na_Whitelist', 'Classificacao']]
+                         'Ultima_Atividade', 'Dias_Inativa', 'Login_Ativo', 'Na_Whitelist', 'Classificacao', 'Estagio']]
 
-    # 6. Exportação
-    data_hoje = datetime.now().strftime("%Y%m%d_%H%M")
-    caminho_exportacao = f'relatorios/Relatorio_Inativos_{data_hoje}.csv'
-    os.makedirs('relatorios', exist_ok=True)
-    df_final.to_csv(caminho_exportacao, index=False, sep=';', encoding='utf-8-sig')
+    # 6. Exportação: por padrão o CSV traz só o que exige atenção; o resto aparece como contagem no e-mail
+    if CSV_SOMENTE_PENDENCIAS:
+        df_csv = df_final[df_final['Classificacao'].str.match(r'(CANDIDATA|REVISAR)')]
+    else:
+        df_csv = df_final
+
+    caminho_exportacao = None  # sem pendências, nenhum CSV é gerado
+    if not df_csv.empty:
+        data_hoje = datetime.now().strftime("%Y%m%d_%H%M")
+        caminho_exportacao = f'relatorios/Relatorio_Inativos_{data_hoje}.csv'
+        os.makedirs('relatorios', exist_ok=True)
+        df_csv.sort_values('Dias_Inativa', ascending=False).to_csv(
+            caminho_exportacao, index=False, sep=';', encoding='utf-8-sig')
 
     return df_final, caminho_exportacao

@@ -3,6 +3,8 @@
 # Lê EXO_APP_ID, EXO_THUMBPRINT e EXO_ORGANIZATION do arquivo .env
 # ==============================================================================
 
+$ErrorActionPreference = 'Stop'   # qualquer falha encerra o script com código de saída diferente de 0
+
 # --- Carrega o .env (procura na pasta do script e na pasta acima) ---
 $CaminhoEnv = @("$PSScriptRoot\.env", "$PSScriptRoot\..\.env") | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $CaminhoEnv) { throw "Arquivo .env não encontrado em $PSScriptRoot nem na pasta acima." }

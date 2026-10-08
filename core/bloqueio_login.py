@@ -5,6 +5,7 @@ Permissões de aplicativo necessárias (com consentimento do admin):
   - LicenseAssignment.ReadWrite.All ou User.ReadWrite.All (assignLicense)
 """
 import logging
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -19,6 +20,10 @@ COL_TIPO = "Tipo_Caixa"
 COL_CLASSIFICACAO = "Classificacao"
 CLASSIFICACAO_ALVO = "CANDIDATA A BLOQUEIO"
 COL_DIAS = "Dias_Inativa"
+COL_ESTAGIO = "Estagio"
+# Valores da coluna Estagio (os mesmos gerados em classificacao_contas.py)
+ESTAGIO_BLOQUEAR = "BLOQUEAR"          # só bloqueia o login
+ESTAGIO_COMPLETO = "CICLO COMPLETO"    # bloquear -> converter em compartilhada -> remover licença
 # Só estes tipos são bloqueados automaticamente ('Desconhecido' etc. exige revisão manual)
 TIPOS_ELEGIVEIS = {"usermailbox", "sharedmailbox"}
 DIAS_NUNCA_ACESSADA = 999  # valor que classificacao_contas usa quando não há atividade
@@ -38,6 +43,19 @@ def _resultado(email, tipo, acao, status, detalhe=""):
         "Detalhe": detalhe,
         "Data_Acao": datetime.now().strftime("%d/%m/%Y %H:%M"),
     }
+
+
+def _login_bloqueado(email, headers, tentativas=6, espera=5):
+    """Relê a conta até accountEnabled aparecer como False (o Entra ID pode levar alguns segundos para refletir)."""
+    for i in range(tentativas):
+        r = requests.get(f"{GRAPH}/users/{email}", headers=headers,
+                         params={"$select": "accountEnabled"}, timeout=30)
+        r.raise_for_status()
+        if r.json().get("accountEnabled") is False:
+            return True
+        if i < tentativas - 1:
+            time.sleep(espera)
+    return False
 
 
 def bloquear_conta(token, email, tipo, dry_run=True, remover_licenca=False):
@@ -74,6 +92,12 @@ def bloquear_conta(token, email, tipo, dry_run=True, remover_licenca=False):
             r = requests.patch(f"{GRAPH}/users/{email}", headers=h,
                                json={"accountEnabled": False}, timeout=30)
             r.raise_for_status()
+            # Só segue se o bloqueio for CONFIRMADO relendo a conta
+            passo = "confirmar bloqueio"
+            if not _login_bloqueado(email, h):
+                return _resultado(email, tipo, acao, "ERRO",
+                                  "[confirmar bloqueio] bloqueio solicitado, mas o login ainda aparece ativo "
+                                  "no Entra ID: confira em Usuários")
             # Derruba sessões/tokens ativos. Se falhar, o login JÁ está bloqueado: não é erro fatal.
             passo = "derrubar sessões"
             rs = requests.post(f"{GRAPH}/users/{email}/revokeSignInSessions",

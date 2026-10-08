@@ -1,5 +1,12 @@
+# Segredos e configuração local
 .env
+
+# Dados com e-mails de funcionários
 relatorios/
+logs/
+config/*.csv
+
+# Python
 __pycache__/
-whitelist.csv
-tipos_caixa_exchange.csv
+*.pyc
+.venv/
