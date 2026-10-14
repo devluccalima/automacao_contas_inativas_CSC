@@ -18,6 +18,9 @@ if (-not (Test-Path $Python)) { $Python = 'python' }
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
 
+# O Python grava UTF-8; sem isto o Windows PowerShell 5.1 lê a saída como OEM e o log fica com acentos trocados
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+
 & $Python 'main.py' 2>&1 | Out-File -FilePath $Log -Encoding utf8
 $codigo = $LASTEXITCODE
 

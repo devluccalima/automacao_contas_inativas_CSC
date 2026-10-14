@@ -16,9 +16,9 @@ LICENCAS_SEM_CUSTO = {
 NUNCA_ACESSADA = 999  # valor usado quando não há Last Activity Date
 DIAS_CONTA_RECENTE = 15  # conta criada há até N dias e sem acesso ainda é considerada recente
 # Escalonamento por dias de inatividade (contas com licença paga):
-DIAS_BLOQUEIO_USUARIO = 20         # UserMailbox acima disso: candidata, estágio BLOQUEAR (só bloqueia o login)
-DIAS_CONVERSAO_USUARIO = 45        # UserMailbox acima disso: estágio CICLO COMPLETO (bloquear -> converter -> remover licença)
-DIAS_CONVERSAO_COMPARTILHADA = 45  # SharedMailbox acima disso: candidata direto no CICLO COMPLETO (já é compartilhada)
+DIAS_BLOQUEIO_USUARIO = 35         # UserMailbox acima disso: candidata, estágio BLOQUEAR (só bloqueia o login)
+DIAS_CONVERSAO_USUARIO = 55        # UserMailbox acima disso: estágio CICLO COMPLETO (bloquear -> converter -> remover licença)
+DIAS_CONVERSAO_COMPARTILHADA = 55  # SharedMailbox acima disso: candidata direto no CICLO COMPLETO (já é compartilhada)
 
 # True: o CSV traz só o que exige atenção (candidatas e revisão manual). False: traz todas as contas.
 CSV_SOMENTE_PENDENCIAS = True

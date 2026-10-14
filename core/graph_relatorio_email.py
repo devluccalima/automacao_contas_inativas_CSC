@@ -5,6 +5,13 @@ import io
 import base64
 import os
 import html
+import re
+
+
+def _destinatarios(texto):
+    """Aceita um ou vários e-mails separados por vírgula ou ponto e vírgula."""
+    enderecos = [e.strip() for e in re.split(r"[;,]", texto or "") if e.strip()]
+    return [{"emailAddress": {"address": e}} for e in enderecos]
 
 
 def get_email_activity_report(token):
@@ -100,7 +107,7 @@ def enviar_email_aviso(token, remetente, destinatario, assunto, mensagem):
              f"<p>{html.escape(str(mensagem))}</p>")
     resposta = _enviar_graph(token, remetente, {
         "message": {"subject": assunto, "body": {"contentType": "HTML", "content": corpo},
-                    "toRecipients": [{"emailAddress": {"address": destinatario}}]},
+                    "toRecipients": _destinatarios(destinatario)},
         "saveToSentItems": "false",
     })
     if resposta.status_code == 202:
@@ -206,7 +213,7 @@ def enviar_email_resumo(token, remetente, destinatario, caminho_arquivo, df_fina
     mensagem = {
         "subject": assunto,
         "body": {"contentType": "HTML", "content": corpo_html},
-        "toRecipients": [{"emailAddress": {"address": destinatario}}],
+        "toRecipients": _destinatarios(destinatario),
     }
     if anexos:
         mensagem["attachments"] = anexos

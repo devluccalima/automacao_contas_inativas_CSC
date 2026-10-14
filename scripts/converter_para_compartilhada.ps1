@@ -19,6 +19,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# O Windows PowerShell 5.1 / .NET Framework pode usar TLS antigo por padrão; o Entra ID e o Exchange Online exigem TLS 1.2
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $resultados = @()
 
 function Get-TamanhoBytes([string]$email) {

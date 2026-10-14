@@ -84,9 +84,9 @@ python ferramentas\processar_conta_unica.py conta@dominio.com --real   # executa
 | E-mail na whitelist | `WHITELIST` |
 | Caixa de sistema (Room, Discovery, Scheduling) ou sem licença paga | ocultada |
 | Tipo de caixa não identificado | `REVISAR (TIPO DESCONHECIDO)` |
-| `UserMailbox` com licença paga, inativa há mais de `DIAS_BLOQUEIO_USUARIO` (20) dias | `CANDIDATA A BLOQUEIO`, estágio `BLOQUEAR` (só bloqueia o login) |
-| `UserMailbox` inativa há mais de `DIAS_CONVERSAO_USUARIO` (45) dias | `CANDIDATA A BLOQUEIO`, estágio `CICLO COMPLETO` (bloquear → converter → remover licença) |
-| `SharedMailbox` com licença paga, inativa há mais de `DIAS_CONVERSAO_COMPARTILHADA` (45) dias | `CANDIDATA A BLOQUEIO`, estágio `CICLO COMPLETO` |
+| `UserMailbox` com licença paga, inativa há mais de `DIAS_BLOQUEIO_USUARIO` (35) dias | `CANDIDATA A BLOQUEIO`, estágio `BLOQUEAR` (só bloqueia o login) |
+| `UserMailbox` inativa há mais de `DIAS_CONVERSAO_USUARIO` (55) dias | `CANDIDATA A BLOQUEIO`, estágio `CICLO COMPLETO` (bloquear → converter → remover licença) |
+| `SharedMailbox` com licença paga, inativa há mais de `DIAS_CONVERSAO_COMPARTILHADA` (55) dias | `CANDIDATA A BLOQUEIO`, estágio `CICLO COMPLETO` |
 | Sem atividade e criada há até `DIAS_CONTA_RECENTE` (15) dias | `CONTA RECENTE` |
 | Sem atividade e criada há mais tempo (ou sem data de criação) | `REVISAR (NUNCA ACESSADA)` |
 | Candidata no estágio `BLOQUEAR` cujo login **já está bloqueado** | `BLOQUEADA (AGUARDANDO CONVERSÃO)` (não é pendência) |
@@ -96,7 +96,7 @@ Só `CANDIDATA A BLOQUEIO` é processada. Contas `REVISAR` nunca são bloqueadas
 
 **O que vai no CSV:** por padrão (`CSV_SOMENTE_PENDENCIAS = True`), só candidatas e contas para revisão manual. Contas
 ativas, na whitelist, recentes ou já bloqueadas aguardando conversão aparecem como contagem no e-mail. Sem pendências,
-nenhum CSV é gerado. Candidatas com **mais de 45 dias** continuam como pendência mesmo já bloqueadas, porque ainda falta
+nenhum CSV é gerado. Candidatas com **mais de 55 dias** continuam como pendência mesmo já bloqueadas, porque ainda falta
 converter e remover a licença.
 
 ## Permissões necessárias
