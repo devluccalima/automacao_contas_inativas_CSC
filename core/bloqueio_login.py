@@ -26,7 +26,6 @@ ESTAGIO_BLOQUEAR = "BLOQUEAR"          # só bloqueia o login
 ESTAGIO_COMPLETO = "CICLO COMPLETO"    # bloquear -> converter em compartilhada -> remover licença
 # Só estes tipos são bloqueados automaticamente ('Desconhecido' etc. exige revisão manual)
 TIPOS_ELEGIVEIS = {"usermailbox", "sharedmailbox"}
-DIAS_NUNCA_ACESSADA = 999  # valor que classificacao_contas usa quando não há atividade
 MAX_ERROS_SEGUIDOS = 5  # interrompe o lote se houver muitos erros em sequência
 
 
@@ -126,13 +125,10 @@ def bloquear_conta(token, email, tipo, dry_run=True, remover_licenca=False):
 
 
 def processar_bloqueios(token, df, dry_run=True, limite_max=30, lote=None,
-                        remover_licenca_usuarios=False, remover_licenca_shared=False,
-                        permitir_nunca_acessadas=False):
+                        remover_licenca_usuarios=False, remover_licenca_shared=False):
     """Bloqueia todas as candidatas do DataFrame e devolve um DataFrame de resultados."""
     alvo = df[df[COL_CLASSIFICACAO] == CLASSIFICACAO_ALVO]
     alvo = alvo[alvo[COL_TIPO].astype(str).str.lower().isin(TIPOS_ELEGIVEIS)]
-    if not permitir_nunca_acessadas:
-        alvo = alvo[alvo[COL_DIAS] < DIAS_NUNCA_ACESSADA]
 
     if len(alvo) > limite_max:
         raise RuntimeError(

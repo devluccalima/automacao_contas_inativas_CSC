@@ -51,12 +51,29 @@ function Get-MotivosManterLicenca([string]$email) {
 # Importa o módulo de forma explícita: se falhar, a mensagem mostra a causa real
 Import-Module ExchangeOnlineManagement -ErrorAction Stop
 
+# Converte a data do Exchange para UTC em texto; o ano 1601 é o valor do Exchange para "nunca" e vira vazio
+function Get-DataUtc($valor) {
+    if (-not $valor) { return '' }
+    try { $d = [datetime]$valor } catch { return '' }
+    if ($d.Year -le 1900) { return '' }
+    # O Exchange devolve horários em UTC. Sem tipo definido, trata como UTC: ToUniversalTime() assumiria hora local
+    # e somaria o fuso (3 horas no horário de Brasília).
+    if ($d.Kind -eq [System.DateTimeKind]::Local) { $d = $d.ToUniversalTime() }
+    else { $d = [datetime]::SpecifyKind($d, [System.DateTimeKind]::Utc) }
+    return $d.ToString('yyyy-MM-ddTHH:mm:ssZ')
+}
+
 Connect-ExchangeOnline -AppId $AppId -CertificateThumbprint $Thumbprint -Organization $Organization -ShowBanner:$false
 
 try {
     $emails = Get-Content -Path $EmailsJson -Raw -Encoding UTF8 | ConvertFrom-Json
 
+    $total = @($emails).Count
+    $n = 0
+
     foreach ($email in @($emails)) {
+        $n++
+        Write-Host ("[{0}/{1}] {2}" -f $n, $total, $email)
         $r = [ordered]@{
             Email              = "$email"
             TipoInicial        = $null
@@ -65,6 +82,8 @@ try {
             PodeRemoverLicenca = $false
             Motivos            = ''
             Erro               = ''
+            UltimoLogon        = ''
+            UltimaInteracao    = ''
         }
         try {
             $mbx = Get-Mailbox -Identity $email
@@ -90,6 +109,13 @@ try {
                 if (-not $r.Convertida) { throw "conversão não confirmada após $TimeoutSegundos s" }
             }
 
+            # Atividade em tempo quase real (o relatório de uso do Graph chega com ~2 dias de atraso)
+            $stats = Get-MailboxStatistics -Identity $email -ErrorAction SilentlyContinue
+            if ($stats) {
+                $r.UltimoLogon     = Get-DataUtc $stats.LastLogonTime
+                $r.UltimaInteracao = Get-DataUtc $stats.LastInteractionTime
+            }
+
             $motivos = @(Get-MotivosManterLicenca $email)
             $r.Motivos = ($motivos -join '; ')
             $r.PodeRemoverLicenca = ($motivos.Count -eq 0)
@@ -98,6 +124,11 @@ try {
             $r.Erro = $_.Exception.Message
         }
         $resultados += [pscustomobject]$r
+        $ultimo = @($r.UltimoLogon, $r.UltimaInteracao) | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
+        if (-not $ultimo) { $ultimo = "nenhuma" }
+        $situacao = "tipo=$($r.TipoFinal) | última atividade no Exchange=$ultimo | licença pode sair=$($r.PodeRemoverLicenca)"
+        if ($r.Erro) { $situacao = "ERRO: $($r.Erro)" }
+        Write-Host "      $situacao"
     }
 }
 finally {

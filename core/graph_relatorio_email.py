@@ -32,11 +32,12 @@ def get_email_activity_report(token):
 
 
 def get_dados_entra(token):
-    """Retorna {UPN em minúsculas: {"criada_em": data ISO, "login_ativo": bool}} de todos os usuários do Entra ID.
+    """Retorna {UPN em minúsculas: {"criada_em": data ISO, "login_ativo": bool, "n_licencas": int}} de todos os usuários
+    do Entra ID. O número de licenças vem AO VIVO (o relatório de uso mostra as licenças com atraso).
     Usa a permissão User.Read.All (já coberta pelo User.ReadWrite.All)."""
     headers = {"Authorization": f"Bearer {token}"}
     url = ("https://graph.microsoft.com/v1.0/users"
-           "?$select=userPrincipalName,createdDateTime,accountEnabled&$top=999")
+           "?$select=userPrincipalName,createdDateTime,accountEnabled,assignedLicenses&$top=999")
     dados = {}
     while url:
         resposta = requests.get(url, headers=headers)
@@ -48,6 +49,7 @@ def get_dados_entra(token):
                 dados[u["userPrincipalName"].lower()] = {
                     "criada_em": u.get("createdDateTime"),
                     "login_ativo": u.get("accountEnabled"),
+                    "n_licencas": len(u.get("assignedLicenses") or []),
                 }
         url = pagina.get("@odata.nextLink")
     return dados
@@ -95,6 +97,21 @@ def _anexo_csv(caminho):
     }
 
 
+def _contagens_execucao(df):
+    """Contagens do que a simulação ou a execução fez, a partir do DataFrame de resultados."""
+    if df is None or df.empty:
+        return None
+    res = df["Resultado"]
+    det = df["Detalhe"].fillna("").astype(str)
+    return {
+        "licencas": int((res.eq("LICENCA_REMOVIDA") | (res.eq("SIMULADO") & det.str.contains("Passaria por todas"))).sum()),
+        "so_bloqueio": int((res.eq("BLOQUEADA") | (res.eq("SIMULADO") & det.str.contains("Só bloquear"))).sum()),
+        "mantidas": int((res.eq("CONVERTIDA") | (res.eq("SIMULADO") & det.str.contains("MANTIDA"))).sum()),
+        "protegidas": int((res.eq("PULADA") & det.str.contains("Atividade recente")).sum()),
+        "erros": int(res.eq("ERRO").sum()),
+    }
+
+
 def _enviar_graph(token, remetente, dados_email):
     url = f"https://graph.microsoft.com/v1.0/users/{remetente}/sendMail"
     return requests.post(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -118,7 +135,7 @@ def enviar_email_aviso(token, remetente, destinatario, assunto, mensagem):
 
 def enviar_email_resumo(token, remetente, destinatario, caminho_arquivo, df_final,
                         df_bloqueios=None, caminho_bloqueios=None,
-                        erro_bloqueio=None, dry_run=True):
+                        erro_bloqueio=None, dry_run=True, data_dos_dados=None, atraso_dias=None):
     """Envia o resumo em HTML. Anexa o CSV de pendências (se houver) e o CSV do que foi processado.
     Sem candidatas, o e-mail informa '0 caixas inativas para efetuar a automação'."""
     print(f"Preparando envio de e-mail para {destinatario}...")
@@ -132,6 +149,24 @@ def enviar_email_resumo(token, remetente, destinatario, caminho_arquivo, df_fina
     total_recentes = int((classif == 'CONTA RECENTE').sum())
     total_revisar = int(classif.str.startswith('REVISAR').sum())
     total_ja_bloqueadas = int(classif.str.startswith('BLOQUEADA').sum())
+
+    if data_dos_dados is not None:
+        linha_dados = (f"<li><b>Dados do relatório de uso até:</b> {data_dos_dados:%d/%m/%Y} "
+                       f"({atraso_dias} dia(s) de atraso)</li>")
+    else:
+        linha_dados = "<li><b>Dados do relatório de uso:</b> data desconhecida</li>"
+
+    contagens_corpo = None if erro_bloqueio else _contagens_execucao(df_bloqueios)
+    if contagens_corpo:
+        verbo = "seriam recuperadas" if dry_run else "recuperadas"
+        linha_execucao = (
+            f"<li><b>Nesta {'simulação' if dry_run else 'execução'}:</b> {contagens_corpo['licencas']} licença(s) {verbo} · "
+            f"{contagens_corpo['so_bloqueio']} só bloqueio · {contagens_corpo['mantidas']} com licença mantida "
+            f"(arquivo morto, hold, tamanho ou grupo) · {contagens_corpo['protegidas']} protegida(s) por atividade recente · "
+            f"{contagens_corpo['erros']} erro(s)</li>"
+        )
+    else:
+        linha_execucao = ""
 
     if total_candidatas == 0:
         # Nada a processar nesta execução
@@ -191,6 +226,8 @@ def enviar_email_resumo(token, remetente, destinatario, caminho_arquivo, df_fina
     <h3 style='color: #d9534f;'>Resumo Geral:</h3>
     <ul>
         {linha_candidatas}
+        {linha_dados}
+        {linha_execucao}
         <li><b>Já bloqueadas, aguardando o prazo de conversão:</b> {total_ja_bloqueadas} caixas</li>
         <li><b>Caixas Ativas:</b> {total_ativas} caixas</li>
         <li><b>Contas recentes, ainda sem uso (aguardando):</b> {total_recentes} caixas</li>
@@ -201,14 +238,23 @@ def enviar_email_resumo(token, remetente, destinatario, caminho_arquivo, df_fina
 
     # Assunto: deixa claro quando é simulação e quantas contas foram de fato bloqueadas
     prefixo = "[SIMULAÇÃO] " if dry_run else ""
+    if erro_bloqueio:
+        prefixo = "[NADA ALTERADO] " + prefixo  # o processamento não rodou: o motivo está no corpo do e-mail
+    contagens = None if erro_bloqueio else _contagens_execucao(df_bloqueios)
     if total_candidatas == 0:
         assunto = f"{prefixo}Automação M365: 0 caixas inativas para processar"
+    elif contagens:
+        if dry_run:
+            partes = [f"{contagens['licencas']} licenças seriam recuperadas", f"{contagens['so_bloqueio']} só bloqueio"]
+        else:
+            partes = [f"{contagens['licencas']} licenças recuperadas", f"{contagens['so_bloqueio']} bloqueadas"]
+        if contagens["protegidas"]:
+            partes.append(f"{contagens['protegidas']} protegidas por atividade recente")
+        if contagens["erros"]:
+            partes.append(f"{contagens['erros']} erro(s)")
+        assunto = f"{prefixo}Aviso de Otimização M365: " + " · ".join(partes)
     else:
-        assunto = f"{prefixo}Aviso de Otimização M365: {total_completo} Licenças podem ser recuperadas"
-        if df_bloqueios is not None and not df_bloqueios.empty and not dry_run:
-            n_bloqueadas = int(df_bloqueios["Resultado"].isin(["BLOQUEADA", "CONVERTIDA", "LICENCA_REMOVIDA"]).sum())
-            if n_bloqueadas:
-                assunto += f" ({n_bloqueadas} bloqueadas nesta execução)"
+        assunto = f"{prefixo}Aviso de Otimização M365: {total_completo} candidatas no ciclo completo"
 
     mensagem = {
         "subject": assunto,

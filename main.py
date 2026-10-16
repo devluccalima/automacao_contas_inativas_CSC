@@ -92,9 +92,24 @@ def main():
 
         df_resultado, caminho_csv = gerar_relatorio_inativos(lista_relatorio, dados_entra)
 
+        # Trava de dados velhos: o relatório de uso chega com atraso (de 2 a 14 dias já foi visto). Se a data dos dados
+        # for mais antiga que o limite, nenhuma conta é alterada; o e-mail avisa.
+        MAX_ATRASO = int(os.getenv("MAX_ATRASO_RELATORIO_DIAS", "3"))
+        data_dados = df_resultado.attrs.get("data_dos_dados")
+        atraso = (datetime.now().date() - data_dados.date()).days if data_dados is not None else None
+        if atraso is not None:
+            print(f"📅 Defasagem do relatório de uso: {atraso} dia(s) (limite para agir: {MAX_ATRASO})")
+        dados_velhos = atraso is None or atraso > MAX_ATRASO
+
         # --- Bloqueio (fase 1) ou escalonado por estágio (fase 2) ---
         df_bloqueios, caminho_bloqueios, erro_bloqueio = None, None, None
         try:
+            if dados_velhos:
+                detalhe = "data desconhecida" if atraso is None else f"{atraso} dia(s) de atraso"
+                raise RuntimeError(
+                    f"Os dados do relatório de uso estão velhos ({detalhe}; limite de {MAX_ATRASO}). "
+                    "Nenhuma conta foi alterada nesta execução."
+                )
             if FASE == "2":
                 df_bloqueios = processar_fase2(
                     token, df_resultado,
@@ -120,6 +135,7 @@ def main():
             token, EMAIL_REMETENTE, EMAIL_DESTINATARIO, caminho_csv, df_resultado,
             df_bloqueios=df_bloqueios, caminho_bloqueios=caminho_bloqueios,
             erro_bloqueio=erro_bloqueio, dry_run=DRY_RUN,
+            data_dos_dados=data_dados, atraso_dias=atraso,
         )
         return 0
 

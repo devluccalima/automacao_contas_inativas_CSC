@@ -17,7 +17,9 @@ CSV de pendências e envia um e-mail com o resumo. Roda sozinha toda semana pelo
 
 ## Estágios e regras
 
-A inatividade é medida pela **última atividade de e-mail** (enviar, ler, receber). Só contas com **licença paga** entram
+A inatividade é medida pela **última atividade de e-mail** (enviar, ler, receber) e contada a partir da **data dos dados do
+relatório** (`Report Refresh Date`), e não de hoje. Se essa data for mais velha que `MAX_ATRASO_RELATORIO_DIAS` (padrão 3),
+a execução gera o relatório e o e-mail, mas **nenhuma conta é alterada**. Só contas com **licença paga** entram
 (licenças gratuitas como Power Automate Free e Fabric Free não contam).
 
 ```
@@ -29,13 +31,13 @@ dias sem atividade:   0 ─────────── 35 ──────�
 | Situação | Resultado |
 |---|---|
 | E-mail na whitelist | `WHITELIST` (nunca é tocada) |
-| Caixa de sistema (Room, Discovery, Scheduling) ou sem licença paga | ocultada |
+| Caixa de sistema (Room, Discovery, Scheduling), sem licença paga no relatório ou **sem nenhuma licença no Entra ID agora** (leitura ao vivo) | ocultada |
 | Tipo de caixa não identificado | `REVISAR (TIPO DESCONHECIDO)` |
 | `UserMailbox` inativa há mais de `DIAS_BLOQUEIO_USUARIO` (**35**) dias | `CANDIDATA A BLOQUEIO`, estágio `BLOQUEAR` |
 | `UserMailbox` inativa há mais de `DIAS_CONVERSAO_USUARIO` (**55**) dias | `CANDIDATA A BLOQUEIO`, estágio `CICLO COMPLETO` |
 | `SharedMailbox` inativa há mais de `DIAS_CONVERSAO_COMPARTILHADA` (**55**) dias | `CANDIDATA A BLOQUEIO`, estágio `CICLO COMPLETO` |
-| Sem atividade e criada há até `DIAS_CONTA_RECENTE` (**15**) dias | `CONTA RECENTE` |
-| Sem atividade e criada há mais tempo (ou sem data de criação) | `REVISAR (NUNCA ACESSADA)` |
+| **Nunca acessada** (sem nenhuma atividade) e com data de criação: a **idade da conta** vale como dias de inatividade, com os mesmos limites acima | `CANDIDATA A BLOQUEIO` (estágio `BLOQUEAR` ou `CICLO COMPLETO`); dentro do prazo, `CONTA RECENTE` |
+| Nunca acessada e **sem data de criação** | `REVISAR (NUNCA ACESSADA)` |
 | Candidata no estágio `BLOQUEAR` cujo login **já está bloqueado** | `BLOQUEADA (AGUARDANDO CONVERSÃO)` (não é pendência) |
 | Demais casos | `ATIVA` |
 
@@ -47,8 +49,9 @@ convertida na primeira em que passa de 55: o intervalo real é de **2 a 3 semana
 limites com a automação rodando. Contas que **já estavam acima de 55 dias** na primeira execução são bloqueadas,
 convertidas e perdem a licença na mesma execução: para esse acúmulo inicial, a única proteção é o `LOTE`.
 
-Contas `REVISAR` nunca são alteradas automaticamente. Elas reaparecem todo dia no CSV até alguém decidir (whitelist ou
-ação manual).
+Contas `REVISAR` nunca são alteradas automaticamente: hoje são só as de **tipo de caixa desconhecido** e as nunca acessadas
+sem data de criação. Elas reaparecem no CSV até alguém decidir (whitelist ou ação manual). Para voltar a deixar toda conta
+nunca acessada em revisão manual, use `TRATAR_NUNCA_ACESSADAS = False` em `classificacao_contas.py`.
 
 ### Segurança em cada passo
 
@@ -56,10 +59,32 @@ Cada conta do ciclo completo só avança quando o passo anterior é **confirmado
 
 | Passo | Confirmação | Se falhar |
 |---|---|---|
+| 0. **Trava de atividade recente** (Exchange, somente leitura) | `LastInteractionTime` ou `LastLogonTime` nos últimos 14 dias (`DIAS_ATIVIDADE_RECENTE`), **em contas com o login ativo** | `PULADA`: a conta não é alterada |
 | 1. Bloquear o login (Graph) | Relê a conta até `accountEnabled=False` (até ~30 s) | `ERRO`; não converte nem mexe na licença |
 | 2. Converter em compartilhada (Exchange) | Espera o tipo virar `SharedMailbox` (verifica a cada 5 s, até 90 s) | `ERRO`; a licença não é tocada |
 | 3. Verificar se a licença pode sair | Caixa abaixo de 45 GB, sem arquivo morto e sem litigation hold/retenção | Converte, mas **mantém a licença** e diz o motivo |
 | 4. Remover a licença (Graph) | Exige tipo `SharedMailbox` confirmado e relê até a licença sumir | `CONVERTIDA` com aviso "confira em Licenças" |
+
+**Por que as duas travas existem.** O relatório de uso do Graph é um retrato em lote: o `Report Refresh Date` é o dia até o
+qual ele vai, e a diferença para hoje já foi de 2 a 14 dias. Quem começa a usar o e-mail depois desse retrato aparece como
+inativo ou "nunca acessado". Por isso: (1) dados velhos demais bloqueiam a execução inteira; (2) antes de qualquer ação, o
+Exchange é consultado (somente leitura) e uma conta com interação ou logon recentes não é tocada, mesmo que o relatório a
+mostre inativa. O `LastUserActionTime` não é usado porque atrasa; o `LastLogonTime` pode ser atualizado também por processos
+em segundo plano, então, se gerar muitas contas puladas, remova-o de `CAMPOS_ATIVIDADE_EXCHANGE` em `conversao_e_licenca.py`.
+Para agir mesmo assim, depois de conferir a conta, use `--forcar` nas ferramentas manuais.
+
+**A trava só vale para contas com o login ativo.** Em conta com o login já bloqueado o dono não consegue entrar, então a
+atividade vem de delegados ou processos (por exemplo, uma caixa compartilhada usada pela equipe). Isso não impede converter em
+compartilhada nem tirar a licença, porque os delegados continuam com acesso; tamanho, arquivo morto e hold continuam sendo
+verificados. Nesses casos o `Detalhe` registra "Atividade de delegados ou processos ignorada (login já bloqueado)". Se o login
+não puder ser lido no Entra ID, a trava vale.
+
+**O que foi comprovado no ambiente (leitura de 16/10/2026).** Receber e-mail não atualiza nenhum dos dois campos: uma caixa
+que recebe milhares de mensagens sem uso manteve o último logon em 21/08 e nunca teve interação (o ano 1601 significa "nunca"). Em
+compensação, caixas funcionais usadas por delegados ou integrações aparecem ativas no Exchange mesmo com zero ações no relatório
+de uso, e a trava as protege. O campo `LastLoggedOnUserAccount` vem vazio neste tenant, então não dá para saber *quem* entrou.
+Os horários do `Get-MailboxStatistics` vêm em **UTC** (Brasília = UTC−3, ou seja, 17:41 no Exchange é 14:41 em Brasília); o
+script os trata como UTC e o `Detalhe` mostra o horário do servidor.
 
 Outras travas: modo padrão é simulação; `LIMITE_MAX` aborta se houver candidatas demais; o processamento para após 5
 erros seguidos ou na primeira falha do script do Exchange; contas sincronizadas com o AD local e contas com função
@@ -68,7 +93,8 @@ administrativa no Entra ID não são alteradas (`PULADA` / `ERRO`). Licenças he
 
 ## O que o e-mail e os CSVs mostram
 
-- **E-mail:** resumo (candidatas por estágio, já bloqueadas aguardando conversão, ativas, recentes, revisão manual), a
+- **E-mail:** o assunto traz as contagens da execução (licenças recuperadas ou que seriam, só bloqueio, protegidas por atividade
+  recente, erros) e o resumo repete esses números; abaixo, resumo (candidatas por estágio, já bloqueadas aguardando conversão, ativas, recentes, revisão manual), a
   tabela do que foi processado e os anexos. Em simulação, o assunto começa com `[SIMULAÇÃO]`.
 - **`relatorios/Relatorio_Inativos_*.csv`:** só pendências (candidatas e revisão manual), com data de criação, última
   atividade, login ativo e estágio. Sem pendências, o arquivo não é gerado. Para incluir todas as contas, use
@@ -102,7 +128,8 @@ automacao_contas_inativas/
 │   ├── registrar_tarefa_agendada.ps1      Cria a tarefa semanal (padrão: quarta 19:00)
 │   └── verificar_ambiente.ps1       Confere .env, .NET, Python, módulo, certificado, rede e tarefa
 ├── ferramentas/
-│   └── processar_conta_unica.py     Roda o ciclo completo em UMA conta específica
+│   ├── processar_conta_unica.py     Roda o ciclo completo em UMA conta específica
+│   └── processar_lista_contas.py    Roda o ciclo completo em uma LISTA de contas já revisadas por você
 ├── core/
 │   ├── graph_auth.py                Autenticação no Microsoft Graph
 │   ├── extracao_tipos_caixa.py      Roda a extração do Exchange e valida o CSV
@@ -127,6 +154,7 @@ Use o `.env.example` como modelo. O `.env` **prevalece** sobre variáveis do ter
 | `FASE` | `1` só bloqueia o login de **todas** as candidatas (freio geral); `2` escalonado por estágio |
 | `LIMITE_MAX` | Se houver mais candidatas que isso, aborta o bloqueio (protege contra relatório anômalo) |
 | `LOTE` | Quantas contas alterar por execução; `0` = sem limite. Contas `JA_BLOQUEADA`, `PULADA` e `ERRO` não gastam o lote |
+| `MAX_ATRASO_RELATORIO_DIAS` | Padrão 3. Se os dados do relatório de uso forem mais velhos que isso, nenhuma conta é alterada |
 | `ATUALIZAR_TIPOS_CAIXA` | `true` (padrão) roda a extração antes de cada execução; `false` usa o CSV existente |
 | `EXO_APP_ID`, `EXO_THUMBPRINT`, `EXO_ORGANIZATION` | Autenticação por certificado no Exchange Online |
 | `POWERSHELL_EXE` | Opcional: `pwsh` se o módulo estiver no PowerShell 7 (no servidor, deixe sem) |
@@ -141,10 +169,16 @@ Administrators, SYSTEM e à conta de serviço).
 python main.py                                                            # execução completa
 python ferramentas\processar_conta_unica.py conta@dominio.com             # simulação em UMA conta (só lê)
 python ferramentas\processar_conta_unica.py conta@dominio.com --real      # executa; pede para digitar o e-mail
+python ferramentas\processar_lista_contas.py lista.txt                    # simulação em uma lista de contas (só lê)
+python ferramentas\processar_lista_contas.py lista.txt --real             # executa; pede para digitar a quantidade
 ```
 
-A ferramenta de conta única ignora a classificação e a whitelist: age na conta informada. No servidor, rode como a
-**conta de serviço** (o certificado do Exchange está no perfil dela).
+As ferramentas ignoram a classificação: agem nas contas informadas (a de lista pula as que estão na whitelist). Ambas passam pela trava de atividade recente do Exchange; `--forcar` a desliga (só use se você mesmo conferiu a conta). O arquivo da
+lista aceita um e-mail por linha ou linhas coladas do relatório (vale o primeiro e-mail de cada linha) e processa em
+**blocos** (`--bloco N`, padrão 8; cada conta leva de 20 a 30 s no Exchange). O resultado é salvo a cada bloco e as contas
+que já ficaram sem licença são puladas, então, se você interromper (Ctrl+C) ou algo falhar, basta rodar o mesmo comando
+de novo. No servidor, rode como a **conta de serviço** (o certificado do Exchange está no
+perfil dela) e longe do horário da tarefa agendada, para as duas execuções não se sobreporem.
 
 ## Operação
 
@@ -281,6 +315,8 @@ Depois de cada etapa, rode `.\scripts\verificar_ambiente.ps1` **como a conta de 
 |---|---|
 | `LastTaskResult` 267011 e a tarefa nunca roda | Veja os eventos do Agendador (`Get-WinEvent -LogName Microsoft-Windows-TaskScheduler/Operational`) |
 | Evento 104/101 com `2147943785` (`0x80070569`) | A conta de serviço não tem o direito "Fazer logon como um trabalho em lote" (ou a GPO o nega) |
+| A execução parece parada, sem saída por minutos | O Exchange leva 20 a 30 s por conta. A ferramenta de lista mostra o progresso por bloco, e o log da tarefa mostra as linhas `[exchange]` de cada conta. Não é timeout: o limite é de 2 minutos por conta mais 5 |
+| Interrompi (Ctrl+C) uma ferramenta ou a execução no meio | Sem risco: a ordem (bloquear → converter → remover a licença) é retomável. Rode de novo: a conta já convertida segue para a verificação e a remoção da licença, e as sem licença são puladas |
 | `Access is denied` ao disparar a tarefa ou ao editar o `.env` | A janela não está **elevada**. Abra o PowerShell como administrador (confira `High Mandatory Level` em `whoami /groups`) |
 | `Error Acquiring Token ... connection was forcibly closed` no Exchange | TLS antigo no .NET: use os scripts atuais (habilitam o TLS 1.2) |
 | `Connect-ExchangeOnline ... não foi possível carregar o módulo` | .NET abaixo de 4.7.2, ou módulo instalado só no PowerShell 7 (`POWERSHELL_EXE=pwsh`) |
@@ -290,16 +326,26 @@ Depois de cada etapa, rode `.\scripts\verificar_ambiente.ps1` **como a conta de 
 | E-mail não chega com vários destinatários | Confirme que `core\graph_relatorio_email.py` é a versão com `_destinatarios` |
 | Acentos trocados no log | Use o `executar_automacao.ps1` atual (força UTF-8) |
 | `Authorization_RequestDenied` em uma conta | Quase sempre é conta com função administrativa |
-| Conta aparece no relatório com licença que já foi removida | O relatório de uso atrasa 1 a 2 dias; o processamento detecta que não há licença e marca `PULADA` |
+| Conta `PULADA` com "Atividade recente: última interação em ...; último logon em ... (Exchange)" | A trava funcionou: o Exchange viu uso nos últimos 14 dias. "Somente logon, sem interação do usuário" indica sincronização ou processo, não pessoa: confira antes de forçar. Se a conta é mesmo ociosa, confira e use `--forcar` na ferramenta manual |
+| E-mail "Os dados do relatório de uso estão velhos" | O relatório do Graph está atrasado além de `MAX_ATRASO_RELATORIO_DIAS`. Nada foi alterado: aguarde ele atualizar (a data aparece no resumo do e-mail) |
+| Conta aparece no relatório de uso com licença que já foi removida | O relatório de uso atrasa e mostra a licença antiga. A automação lê as licenças **ao vivo** no Entra ID e oculta quem já está sem nenhuma; se ainda aparecer, confira se o `get_dados_entra` obteve os dados (mensagem "Dados do Entra ID obtidos" no log) |
 | Conta `PULADA` toda semana | Conta sincronizada com o AD (desative no AD), arquivo morto/hold/tamanho (licença mantida de propósito) ou licença herdada de grupo |
 
 ## Limitações conhecidas
 
 - A inatividade é medida **só pelo e-mail**. Quem usa só Teams, OneDrive ou SharePoint pode parecer inativo: confira os
   relatórios de uso desses serviços antes de liberar lotes grandes e use a whitelist.
-- Caixas que só **recebem** e-mail (apelidos, caixas funcionais) podem aparecer como inativas.
+- Caixas que só **recebem** e-mail (apelidos, caixas funcionais) podem aparecer como inativas. Como as contas nunca acessadas
+  são tratadas automaticamente, uma caixa funcional criada e nunca usada por login será bloqueada e, passado o prazo,
+  convertida: ponha na whitelist as que devem ficar como estão. Contas criadas antes da data de entrada de um funcionário
+  também podem ser bloqueadas se ficarem sem uso além de 35 dias.
 - Remover a licença afeta também Teams, OneDrive e SharePoint do usuário: confirme a política de retenção do OneDrive.
 - Licenças herdadas de grupo e contas sincronizadas com o AD local exigem ação manual.
+- As travas **reduzem** o risco, mas não o eliminam: elas olham a atividade da **caixa de e-mail**. Quem usa só Teams,
+  OneDrive ou SharePoint, ou alguém que começa a usar depois da leitura, não é visto.
+- A trava do Exchange vale para a fase 2 (`FASE=2`) e para as ferramentas manuais. Com `FASE=1` ela não existe.
+- Conta criada antes da entrada do funcionário parece "nunca acessada": se ficar parada por mais de 35 dias, será bloqueada,
+  a menos que haja logon ou interação recentes. Ponha na whitelist as contas provisionadas com antecedência.
 
 ## Histórico
 
@@ -309,3 +355,4 @@ Depois de cada etapa, rode `.\scripts\verificar_ambiente.ps1` **como a conta de 
 | 08/10/2026 | Ciclo completo (bloquear → converter → remover licença) validado em conta real |
 | 13/10/2026 | Servidor Windows Server 2016 configurado: conta de serviço, certificado, TLS 1.2, tarefa agendada |
 | 14/10/2026 | Tarefa validada em simulação; primeiro lote real em produção (11 caixas); rollout em lotes crescentes até a operação semanal |
+| 15/10/2026 | Uma conta que acabara de começar a usar o e-mail foi processada por causa do atraso do relatório: criadas a trava de dados velhos (`Report Refresh Date`) e a trava de atividade recente no Exchange |

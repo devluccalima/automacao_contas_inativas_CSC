@@ -6,6 +6,11 @@ bloquear login → converter em compartilhada → remover licença.
 Uso (de qualquer pasta; o .env é lido da raiz do projeto):
     python ferramentas/processar_conta_unica.py conta@dominio.com          # simulação: só lê, não altera nada
     python ferramentas/processar_conta_unica.py conta@dominio.com --real   # executa de verdade (pede confirmação)
+    python ferramentas/processar_conta_unica.py conta@dominio.com --real --forcar   # ignora a trava de atividade recente
+
+TRAVA: antes de agir, o Exchange é consultado (somente leitura). Conta com logon ou interação do usuário no
+Exchange nos últimos 14 dias NÃO é alterada (PULADA), desde que o login ainda esteja ativo: com o login já bloqueado a
+atividade vem de delegados ou processos e não impede converter nem tirar a licença.
 
 Atenção: o script age SOMENTE na conta informada e ignora a classificação e a whitelist. Confira o e-mail antes de confirmar.
 """
@@ -80,6 +85,8 @@ def main():
     ap = argparse.ArgumentParser(description="Ciclo completo da fase 2 (bloquear → converter → remover licença) em uma única conta.")
     ap.add_argument("email", help="e-mail (UPN) da conta")
     ap.add_argument("--real", action="store_true", help="executa de verdade (padrão: simulação)")
+    ap.add_argument("--forcar", action="store_true",
+                    help="ignora a trava de atividade recente no Exchange (use só se você conferiu a conta)")
     ap.add_argument("--tipo", default="UserMailbox", choices=["UserMailbox", "SharedMailbox"],
                     help="tipo atual da caixa (padrão: UserMailbox)")
     args = ap.parse_args()
@@ -113,7 +120,8 @@ def main():
     df = pd.DataFrame([{"Email": email, "Tipo_Caixa": args.tipo, "Dias_Inativa": 120,
                         "Classificacao": "CANDIDATA A BLOQUEIO", "Estagio": "CICLO COMPLETO"}])
     print("\nExecutando...")
-    res = processar_fase2(token, df, dry_run=not args.real, limite_max=1, lote=1)
+    res = processar_fase2(token, df, dry_run=not args.real, limite_max=1, lote=1,
+                          verificar_atividade=not args.forcar)
 
     print("\n--- Resultado ---")
     if res.empty:

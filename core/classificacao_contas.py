@@ -14,7 +14,9 @@ LICENCAS_SEM_CUSTO = {
 }
 
 NUNCA_ACESSADA = 999  # valor usado quando não há Last Activity Date
-DIAS_CONTA_RECENTE = 15  # conta criada há até N dias e sem acesso ainda é considerada recente
+# True: conta nunca acessada é tratada pelas mesmas regras, contando os dias desde a CRIAÇÃO da conta.
+# False: conta nunca acessada fica sempre em revisão manual.
+TRATAR_NUNCA_ACESSADAS = True
 # Escalonamento por dias de inatividade (contas com licença paga):
 DIAS_BLOQUEIO_USUARIO = 35         # UserMailbox acima disso: candidata, estágio BLOQUEAR (só bloqueia o login)
 DIAS_CONVERSAO_USUARIO = 55        # UserMailbox acima disso: estágio CICLO COMPLETO (bloquear -> converter -> remover licença)
@@ -47,6 +49,18 @@ def gerar_relatorio_inativos(lista_relatorio_unificado, dados_entra=None):
     )
     df_atividade['Ultima_Atividade'] = pd.to_datetime(df_atividade.get('Last Activity Date'), errors='coerce')
 
+    # Data até a qual o relatório de uso tem dados (Report Refresh Date). O relatório chega com atraso e já ficou
+    # parado por dias: a data dos dados é que diz a idade real da informação.
+    data_dos_dados = None
+    if 'Report Refresh Date' in df_atividade.columns:
+        maxima = pd.to_datetime(df_atividade['Report Refresh Date'], errors='coerce').max()
+        if pd.notna(maxima):
+            data_dos_dados = maxima.normalize()
+    if data_dos_dados is not None:
+        print(f"📅 Dados do relatório de uso até {data_dos_dados:%d/%m/%Y}")
+    else:
+        print("⚠️ O relatório de uso não informou a data dos dados (Report Refresh Date)")
+
     df_atividade = df_atividade[['Email', 'Nome', 'Licenças', 'Ultima_Atividade']]
 
     # 2. Tratamento de Tipos de Caixa (PowerShell / Exchange)
@@ -69,6 +83,7 @@ def gerar_relatorio_inativos(lista_relatorio_unificado, dados_entra=None):
         df_final['Email'].map(lambda e: (dados.get(e) or {}).get('criada_em')), errors='coerce', utc=True
     ).dt.tz_localize(None).dt.normalize()
     df_final['Login_Ativo'] = df_final['Email'].map(lambda e: (dados.get(e) or {}).get('login_ativo'))
+    df_final['Licencas_Entra'] = df_final['Email'].map(lambda e: (dados.get(e) or {}).get('n_licencas'))
 
     # 4. Whitelist
     caminho_whitelist = 'config/whitelist.csv'
@@ -79,9 +94,16 @@ def gerar_relatorio_inativos(lista_relatorio_unificado, dados_entra=None):
         lista_whitelist = []
 
     # 5. Regras de Negócio
-    hoje = pd.to_datetime(datetime.now().date())
+    # A inatividade é contada a partir da data dos DADOS (e não de "hoje"): com o relatório atrasado, contar a partir
+    # de hoje faria toda conta parecer mais inativa do que o dado sustenta.
+    hoje = data_dos_dados if data_dos_dados is not None else pd.to_datetime(datetime.now().date())
     df_final['Dias_Inativa'] = (hoje - df_final['Ultima_Atividade']).dt.days
     df_final['Dias_Desde_Criacao'] = (hoje - df_final['Data_Criacao']).dt.days
+
+    # Conta nunca acessada: a inatividade conta desde a criação (quando a data de criação é conhecida)
+    if TRATAR_NUNCA_ACESSADAS:
+        sem_atividade = df_final['Ultima_Atividade'].isna() & df_final['Dias_Desde_Criacao'].notna()
+        df_final.loc[sem_atividade, 'Dias_Inativa'] = df_final.loc[sem_atividade, 'Dias_Desde_Criacao']
 
     def classificar_conta(row):
         if row['Email'] in lista_whitelist:
@@ -95,6 +117,11 @@ def gerar_relatorio_inativos(lista_relatorio_unificado, dados_entra=None):
             return 'IGNORAR'
 
         # Sem licença paga não há custo a recuperar (vale para qualquer tipo de caixa)
+        # Licenças AO VIVO (Entra ID): o relatório de uso mostra as licenças com ~2 dias de atraso e ainda "enxerga" a que
+        # acabamos de remover. Sem nenhuma licença agora, não há nada a recuperar.
+        if pd.notna(row['Licencas_Entra']) and row['Licencas_Entra'] == 0:
+            return 'IGNORAR'
+
         if not tem_licenca_paga(row['Licenças']):
             return 'IGNORAR'
 
@@ -104,14 +131,12 @@ def gerar_relatorio_inativos(lista_relatorio_unificado, dados_entra=None):
 
         limite = DIAS_CONVERSAO_COMPARTILHADA if tipo_caixa == 'sharedmailbox' else DIAS_BLOQUEIO_USUARIO
 
-        # Sem nenhuma atividade registrada: a data de criação separa a conta recém-criada (ainda não
-        # deu tempo de usar) da conta antiga. A antiga continua em revisão manual, pois o relatório
-        # de e-mail não mostra caixas que só recebem mensagens.
-        if dias_inativa >= NUNCA_ACESSADA:
-            criada = row['Data_Criacao']
-            if pd.notna(criada) and (hoje - criada).days <= DIAS_CONTA_RECENTE:
-                return 'CONTA RECENTE'
-            return 'REVISAR (NUNCA ACESSADA)'
+        # Nunca acessada: sem data de criação não dá para julgar (revisão manual). Com ela, a idade da conta
+        # vale como dias de inatividade e segue os mesmos limites; dentro do prazo, é conta recente.
+        if pd.isna(row['Ultima_Atividade']):
+            if not TRATAR_NUNCA_ACESSADAS or pd.isna(row['Data_Criacao']):
+                return 'REVISAR (NUNCA ACESSADA)'
+            return 'CANDIDATA A BLOQUEIO' if dias_inativa > limite else 'CONTA RECENTE'
 
         return 'CANDIDATA A BLOQUEIO' if dias_inativa > limite else 'ATIVA'
 
@@ -136,7 +161,9 @@ def gerar_relatorio_inativos(lista_relatorio_unificado, dados_entra=None):
 
     # Limpeza
     qtd_ignoradas = len(df_final[df_final['Classificacao'] == 'IGNORAR'])
-    print(f"🧹 Contas de sistema e contas sem licença paga ocultadas: {qtd_ignoradas}")
+    sem_licenca_agora = int(((df_final['Classificacao'] == 'IGNORAR') & (df_final['Licencas_Entra'] == 0)).sum())
+    print(f"🧹 Contas de sistema e contas sem licença paga ocultadas: {qtd_ignoradas} "
+          f"(sem nenhuma licença no Entra ID agora: {sem_licenca_agora})")
     df_final = df_final[df_final['Classificacao'] != 'IGNORAR'].copy()
 
     # Formatação
@@ -165,4 +192,5 @@ def gerar_relatorio_inativos(lista_relatorio_unificado, dados_entra=None):
         df_csv.sort_values('Dias_Inativa', ascending=False).to_csv(
             caminho_exportacao, index=False, sep=';', encoding='utf-8-sig')
 
+    df_final.attrs['data_dos_dados'] = data_dos_dados  # lido pelo main.py (trava de dados velhos e e-mail)
     return df_final, caminho_exportacao

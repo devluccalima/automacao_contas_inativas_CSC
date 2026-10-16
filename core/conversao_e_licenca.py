@@ -11,7 +11,9 @@ import logging
 import os
 import subprocess
 import tempfile
+import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import requests
@@ -19,7 +21,7 @@ import requests
 from core.bloqueio_login import (
     GRAPH, _headers, _resultado, bloquear_conta,
     COL_EMAIL, COL_TIPO, COL_CLASSIFICACAO, CLASSIFICACAO_ALVO, COL_DIAS,
-    TIPOS_ELEGIVEIS, DIAS_NUNCA_ACESSADA, MAX_ERROS_SEGUIDOS,
+    TIPOS_ELEGIVEIS, MAX_ERROS_SEGUIDOS,
     COL_ESTAGIO, ESTAGIO_BLOQUEAR, ESTAGIO_COMPLETO,
 )
 
@@ -31,14 +33,78 @@ SCRIPT_PS = os.path.join(
     "scripts", "converter_para_compartilhada.ps1",
 )
 
+# Trava de segurança: atividade registrada no Exchange (logon ou interação do usuário) nos últimos N dias
+# impede QUALQUER ação sobre a conta. O relatório de uso do Graph chega com ~2 dias de atraso; esta leitura é atual.
+DIAS_ATIVIDADE_RECENTE = 14
+
+# Campos do Exchange que contam como atividade (nome no resultado do script, descrição). O LastUserActionTime fica de fora
+# porque atrasa. Se o logon gerar muitas contas puladas (processos em segundo plano também o atualizam), remova a linha
+# do UltimoLogon e fique só com a interação do usuário.
+CAMPOS_ATIVIDADE_EXCHANGE = (
+    ("UltimaInteracao", "última interação"),
+    ("UltimoLogon", "último logon"),
+)
+
 # Resultados que representam alteração efetiva (ou simulada) e portanto gastam o lote
 CONTAM_NO_LOTE = ("BLOQUEADA", "CONVERTIDA", "LICENCA_REMOVIDA", "SIMULADO")
+
+
+def _converter_data_utc(texto):
+    try:
+        return datetime.strptime(texto, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def atividade_recente(dados_exchange, agora=None, dias=None):
+    """Retorna (True, descrição) se o Exchange registrou logon ou interação do usuário nos últimos
+    DIAS_ATIVIDADE_RECENTE dias. dados_exchange é o resultado do script converter_para_compartilhada.ps1.
+    A descrição lista TODOS os sinais recentes e avisa quando só houve logon (sem interação do usuário)."""
+    agora = agora or datetime.now(timezone.utc)
+    limite = timedelta(days=dias or DIAS_ATIVIDADE_RECENTE)
+    recentes = []
+    for campo, rotulo in CAMPOS_ATIVIDADE_EXCHANGE:
+        momento = _converter_data_utc((dados_exchange or {}).get(campo))
+        # O ano 1601 é o valor do Exchange para "nunca": não conta
+        if momento and momento.year > 1900 and agora - momento <= limite:
+            recentes.append((campo, rotulo, momento))
+    if not recentes:
+        return False, ""
+    partes = [f"{rotulo} em {momento.astimezone().strftime('%d/%m/%Y %H:%M')}" for _, rotulo, momento in recentes]
+    if all(campo != "UltimaInteracao" for campo, _, _ in recentes):
+        partes.append("somente logon, sem interação do usuário")
+    return True, "; ".join(partes) + " (Exchange)"
 
 
 def _acao_texto(tipo):
     if tipo == "SharedMailbox":
         return "Bloquear login → remover licença (já é compartilhada)"
     return "Bloquear login → converter em compartilhada → remover licença"
+
+
+def _executar_com_progresso(cmd, timeout):
+    """Roda o comando mostrando a saída em tempo real (o Exchange leva vários minutos para muitas contas).
+    Devolve (código de saída, texto). Mata o processo se estourar o tempo ou se você apertar Ctrl+C."""
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        encoding="oem" if os.name == "nt" else "utf-8", errors="replace",
+    )
+    linhas = []
+
+    def ler():
+        for linha in proc.stdout:
+            linhas.append(linha)
+            print("   [exchange]", linha.rstrip(), flush=True)
+
+    leitor = threading.Thread(target=ler, daemon=True)
+    leitor.start()
+    try:
+        proc.wait(timeout=timeout)
+    except BaseException:  # tempo esgotado, Ctrl+C...
+        proc.kill()
+        raise
+    leitor.join(timeout=10)
+    return proc.returncode, "".join(linhas)
 
 
 def _rodar_powershell(emails, somente_verificar):
@@ -64,14 +130,9 @@ def _rodar_powershell(emails, somente_verificar):
         if somente_verificar:
             cmd.append("-SomenteVerificar")
 
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              encoding="oem" if os.name == "nt" else "utf-8", errors="replace",
-                              timeout=120 * len(emails) + 300)
+        codigo, texto = _executar_com_progresso(cmd, timeout=120 * len(emails) + 300)
         if not os.path.exists(saida):
-            raise RuntimeError(
-                f"Script do Exchange falhou (código {proc.returncode}): "
-                f"{(proc.stderr or proc.stdout)[:400]}"
-            )
+            raise RuntimeError(f"Script do Exchange falhou (código {codigo}): {texto[-400:]}")
         with open(saida, encoding="utf-8-sig") as f:
             dados = json.load(f)
 
@@ -169,8 +230,61 @@ def _finalizar(token, email, tipo, bloqueou_agora, d, dry_run):
     return _resultado(email, tipo, acao, "LICENCA_REMOVIDA")
 
 
-def _processar_chunk(token, chunk, dry_run):
+def _login_ativo(token, email):
+    """True/False conforme o accountEnabled atual no Entra ID. None se não foi possível ler (a trava continua valendo)."""
+    try:
+        r = requests.get(f"{GRAPH}/users/{email}", headers=_headers(token),
+                         params={"$select": "accountEnabled"}, timeout=30)
+        r.raise_for_status()
+        return r.json().get("accountEnabled")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _processar_chunk(token, chunk, dry_run, verificar_atividade=True):
     saida, seguem = [], {}
+    notas = {}  # e-mail -> observação que será anexada ao Detalhe do resultado final
+
+    def _anexar_notas(itens):
+        for r in itens:
+            nota = notas.get(r["Email"])
+            if nota:
+                r["Detalhe"] = f"{r['Detalhe']} | {nota}" if r["Detalhe"] else nota
+        return itens
+
+    # Passo 0 (trava): leitura SOMENTE LEITURA da atividade atual no Exchange. Conta com atividade recente
+    # não é tocada, mesmo que o relatório de uso (atrasado) a mostre como inativa ou nunca acessada.
+    pre = {}
+    if verificar_atividade:
+        try:
+            pre = _rodar_powershell([e for e, _, _ in chunk], somente_verificar=True)
+        except Exception as e:  # noqa: BLE001
+            log.error("Falha no script do Exchange (verificação de atividade): %s", e)
+            for email, tipo, _ in chunk:
+                saida.append(_resultado(email, tipo, _acao_texto(tipo), "ERRO",
+                                        f"[exchange] verificação de atividade falhou: {e} (a conta não foi alterada)"))
+            return saida, True
+        liberadas = []
+        for email, tipo, estagio in chunk:
+            d = pre.get(email.lower())
+            if d is None or d.get("Erro"):
+                motivo = "sem retorno do Exchange" if d is None else d["Erro"]
+                saida.append(_resultado(email, tipo, _acao_texto(tipo), "ERRO",
+                                        f"[verificação] {motivo} (a conta não foi alterada)"))
+                continue
+            recente, descricao = atividade_recente(d)
+            if recente:
+                # A trava protege quem ainda PODE usar a conta. Com o login já bloqueado o dono não entra: a atividade
+                # vem de delegados ou processos e não impede converter em compartilhada nem tirar a licença (os
+                # delegados continuam acessando; tamanho, arquivo morto e hold são verificados adiante). Se o login
+                # não puder ser lido, a trava vale.
+                if _login_ativo(token, email) is not False:
+                    saida.append(_resultado(email, tipo, _acao_texto(tipo), "PULADA",
+                                            f"Atividade recente: {descricao}. Conta NÃO alterada"))
+                    continue
+                notas[email] = f"Atividade de delegados ou processos ignorada (login já bloqueado): {descricao}"
+            liberadas.append((email, tipo, estagio))
+        chunk = liberadas
 
     # Passo 1: bloquear login (aqui NUNCA remove licença)
     for email, tipo, estagio in chunk:
@@ -192,30 +306,33 @@ def _processar_chunk(token, chunk, dry_run):
             saida.append(_resultado(email, tipo, _acao_texto(tipo), r1["Resultado"],
                                     f"Passo 1 (bloqueio): {r1['Detalhe']} — pipeline interrompido para esta conta"))
     if not seguem:
-        return saida, False
+        return _anexar_notas(saida), False
 
-    # Passos 2 e 3: converter e verificar no Exchange (uma chamada para o lote inteiro)
+    # Passos 2 e 3: converter e verificar no Exchange (uma chamada para o lote inteiro).
+    # Em simulação, a leitura do passo 0 já traz tudo o que é preciso: não repete a conexão.
     try:
-        exo = _rodar_powershell(list(seguem), somente_verificar=dry_run)
+        if dry_run and pre:
+            exo = {e: pre[e.lower()] for e in seguem if e.lower() in pre}
+        else:
+            exo = _rodar_powershell(list(seguem), somente_verificar=dry_run)
     except Exception as e:  # noqa: BLE001
         log.error("Falha no script do Exchange: %s", e)
         sufixo = "" if dry_run else " (o login já foi bloqueado)"
         for email, (tipo, _) in seguem.items():
             saida.append(_resultado(email, tipo, _acao_texto(tipo), "ERRO", f"[exchange] {e}{sufixo}"))
-        return saida, True  # falha sistêmica: quem chama deve parar
+        return _anexar_notas(saida), True  # falha sistêmica: quem chama deve parar
 
     # Passo 4: remover licença (só se a conversão foi confirmada e as verificações passaram)
     for email, (tipo, bloqueou_agora) in seguem.items():
         saida.append(_finalizar(token, email, tipo, bloqueou_agora, exo.get(email), dry_run))
-    return saida, False
+    return _anexar_notas(saida), False
 
 
-def processar_fase2(token, df, dry_run=True, limite_max=30, lote=None, permitir_nunca_acessadas=False):
-    """Executa a fase 2 nas candidatas. Em dry_run só consulta (verificações no Exchange), sem alterar nada."""
+def processar_fase2(token, df, dry_run=True, limite_max=30, lote=None, verificar_atividade=True):
+    """Executa a fase 2 nas candidatas. Em dry_run só consulta (verificações no Exchange), sem alterar nada.
+    verificar_atividade=False desliga a trava de atividade recente (uso manual, por sua conta e risco)."""
     alvo = df[df[COL_CLASSIFICACAO] == CLASSIFICACAO_ALVO]
     alvo = alvo[alvo[COL_TIPO].astype(str).str.lower().isin(TIPOS_ELEGIVEIS)]
-    if not permitir_nunca_acessadas:
-        alvo = alvo[alvo[COL_DIAS] < DIAS_NUNCA_ACESSADA]
 
     if len(alvo) > limite_max:
         raise RuntimeError(
@@ -234,7 +351,7 @@ def processar_fase2(token, df, dry_run=True, limite_max=30, lote=None, permitir_
     while pendentes and (lote is None or alteradas < lote):
         n = len(pendentes) if lote is None else lote - alteradas
         chunk, pendentes = pendentes[:n], pendentes[n:]
-        res, falha_exchange = _processar_chunk(token, chunk, dry_run)
+        res, falha_exchange = _processar_chunk(token, chunk, dry_run, verificar_atividade)
         resultados.extend(res)
         for r in res:
             if r["Resultado"] in CONTAM_NO_LOTE:
