@@ -343,7 +343,8 @@ Depois de cada etapa, rode `.\scripts\verificar_ambiente.ps1` **como a conta de 
 - Licenças herdadas de grupo e contas sincronizadas com o AD local exigem ação manual.
 - As travas **reduzem** o risco, mas não o eliminam: elas olham a atividade da **caixa de e-mail**. Quem usa só Teams,
   OneDrive ou SharePoint, ou alguém que começa a usar depois da leitura, não é visto.
-- A trava do Exchange vale para a fase 2 (`FASE=2`) e para as ferramentas manuais. Com `FASE=1` ela não existe.
+- A trava do Exchange vale para a fase 1, a fase 2 e as ferramentas manuais. Na fase 1 ela roda antes de qualquer bloqueio,
+  lendo o Exchange de todas as candidatas (alguns minutos a mais).
 - Conta criada antes da entrada do funcionário parece "nunca acessada": se ficar parada por mais de 35 dias, será bloqueada,
   a menos que haja logon ou interação recentes. Ponha na whitelist as contas provisionadas com antecedência.
 

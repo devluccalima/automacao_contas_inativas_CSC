@@ -241,6 +241,72 @@ def _login_ativo(token, email):
         return None
 
 
+def _checar_atividade(token, itens, acao=None):
+    """Passo 0 (trava): leitura SOMENTE LEITURA da atividade atual no Exchange para uma lista de (email, tipo, estagio).
+    Conta com atividade recente não é tocada, mesmo que o relatório de uso (atrasado) a mostre inativa ou nunca acessada.
+    Devolve (liberadas, resultados, notas, pre, falha): as contas que seguem, os resultados das que ficaram de fora
+    (PULADA/ERRO), observações para o Detalhe, a leitura bruta do Exchange e se o script do Exchange falhou."""
+    resultados, notas, liberadas = [], {}, []
+    try:
+        pre = _rodar_powershell([e for e, _, _ in itens], somente_verificar=True)
+    except Exception as e:  # noqa: BLE001
+        log.error("Falha no script do Exchange (verificação de atividade): %s", e)
+        for email, tipo, _ in itens:
+            resultados.append(_resultado(email, tipo, acao or _acao_texto(tipo), "ERRO",
+                                         f"[exchange] verificação de atividade falhou: {e} (a conta não foi alterada)"))
+        return [], resultados, notas, {}, True
+    for email, tipo, estagio in itens:
+        d = pre.get(email.lower())
+        if d is None or d.get("Erro"):
+            motivo = "sem retorno do Exchange" if d is None else d["Erro"]
+            resultados.append(_resultado(email, tipo, acao or _acao_texto(tipo), "ERRO",
+                                         f"[verificação] {motivo} (a conta não foi alterada)"))
+            continue
+        recente, descricao = atividade_recente(d)
+        if recente:
+            # A trava protege quem ainda PODE usar a conta. Com o login já bloqueado o dono não entra: a atividade
+            # vem de delegados ou processos e não impede converter em compartilhada nem tirar a licença (os
+            # delegados continuam acessando; tamanho, arquivo morto e hold são verificados adiante). Se o login
+            # não puder ser lido, a trava vale.
+            if _login_ativo(token, email) is not False:
+                resultados.append(_resultado(email, tipo, acao or _acao_texto(tipo), "PULADA",
+                                             f"Atividade recente: {descricao}. Conta NÃO alterada"))
+                continue
+            notas[email] = f"Atividade de delegados ou processos ignorada (login já bloqueado): {descricao}"
+        liberadas.append((email, tipo, estagio))
+    return liberadas, resultados, notas, pre, False
+
+
+def aplicar_trava_fase1(token, df, limite_max=30, bloco=25):
+    """Trava de atividade recente para a FASE 1 (só bloqueia o login). Lê o Exchange (somente leitura) das candidatas e
+    separa as protegidas. Devolve (df_para_bloquear, df_resultados_da_trava): o primeiro segue para
+    processar_bloqueios; o segundo traz as contas PULADA/ERRO, que NÃO devem ser alteradas.
+    Se o script do Exchange falhar, nenhuma conta segue (falha segura)."""
+    alvo = df[df[COL_CLASSIFICACAO] == CLASSIFICACAO_ALVO]
+    alvo = alvo[alvo[COL_TIPO].astype(str).str.lower().isin(TIPOS_ELEGIVEIS)]
+    if len(alvo) > limite_max:  # mesma regra de processar_bloqueios, aplicada antes de ler o Exchange
+        raise RuntimeError(
+            f"{len(alvo)} candidatas excedem o limite de segurança ({limite_max}). "
+            "Revise o relatório manualmente ou aumente o limite conscientemente."
+        )
+    itens = [(r[COL_EMAIL], r[COL_TIPO], ESTAGIO_BLOQUEAR) for _, r in alvo.iterrows()]
+    resultados, excluir = [], set()
+    for k in range(0, len(itens), bloco):
+        parte = itens[k:k + bloco]
+        print(f"   [trava] lendo a atividade no Exchange: contas {k + 1} a {k + len(parte)} de {len(itens)}", flush=True)
+        _, res, _, _, falha = _checar_atividade(token, parte, acao="Bloquear login")
+        resultados.extend(res)
+        excluir.update(r["Email"] for r in res)
+        if falha:
+            restantes = itens[k + len(parte):]
+            for email, tipo, _ in restantes:
+                resultados.append(_resultado(email, tipo, "Bloquear login", "ERRO",
+                                             "[exchange] verificação de atividade não executada (falha anterior); conta não alterada"))
+                excluir.add(email)
+            break
+    return df[~df[COL_EMAIL].isin(excluir)].copy(), pd.DataFrame(resultados)
+
+
 def _processar_chunk(token, chunk, dry_run, verificar_atividade=True):
     saida, seguem = [], {}
     notas = {}  # e-mail -> observação que será anexada ao Detalhe do resultado final
@@ -252,39 +318,14 @@ def _processar_chunk(token, chunk, dry_run, verificar_atividade=True):
                 r["Detalhe"] = f"{r['Detalhe']} | {nota}" if r["Detalhe"] else nota
         return itens
 
-    # Passo 0 (trava): leitura SOMENTE LEITURA da atividade atual no Exchange. Conta com atividade recente
-    # não é tocada, mesmo que o relatório de uso (atrasado) a mostre como inativa ou nunca acessada.
+    # Passo 0 (trava): leitura somente leitura da atividade atual no Exchange (ver _checar_atividade)
     pre = {}
     if verificar_atividade:
-        try:
-            pre = _rodar_powershell([e for e, _, _ in chunk], somente_verificar=True)
-        except Exception as e:  # noqa: BLE001
-            log.error("Falha no script do Exchange (verificação de atividade): %s", e)
-            for email, tipo, _ in chunk:
-                saida.append(_resultado(email, tipo, _acao_texto(tipo), "ERRO",
-                                        f"[exchange] verificação de atividade falhou: {e} (a conta não foi alterada)"))
+        chunk, resultados_trava, notas_trava, pre, falha = _checar_atividade(token, chunk)
+        saida.extend(resultados_trava)
+        notas.update(notas_trava)
+        if falha:
             return saida, True
-        liberadas = []
-        for email, tipo, estagio in chunk:
-            d = pre.get(email.lower())
-            if d is None or d.get("Erro"):
-                motivo = "sem retorno do Exchange" if d is None else d["Erro"]
-                saida.append(_resultado(email, tipo, _acao_texto(tipo), "ERRO",
-                                        f"[verificação] {motivo} (a conta não foi alterada)"))
-                continue
-            recente, descricao = atividade_recente(d)
-            if recente:
-                # A trava protege quem ainda PODE usar a conta. Com o login já bloqueado o dono não entra: a atividade
-                # vem de delegados ou processos e não impede converter em compartilhada nem tirar a licença (os
-                # delegados continuam acessando; tamanho, arquivo morto e hold são verificados adiante). Se o login
-                # não puder ser lido, a trava vale.
-                if _login_ativo(token, email) is not False:
-                    saida.append(_resultado(email, tipo, _acao_texto(tipo), "PULADA",
-                                            f"Atividade recente: {descricao}. Conta NÃO alterada"))
-                    continue
-                notas[email] = f"Atividade de delegados ou processos ignorada (login já bloqueado): {descricao}"
-            liberadas.append((email, tipo, estagio))
-        chunk = liberadas
 
     # Passo 1: bloquear login (aqui NUNCA remove licença)
     for email, tipo, estagio in chunk:

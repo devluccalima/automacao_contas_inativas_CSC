@@ -105,7 +105,7 @@ def _contagens_execucao(df):
     det = df["Detalhe"].fillna("").astype(str)
     return {
         "licencas": int((res.eq("LICENCA_REMOVIDA") | (res.eq("SIMULADO") & det.str.contains("Passaria por todas"))).sum()),
-        "so_bloqueio": int((res.eq("BLOQUEADA") | (res.eq("SIMULADO") & det.str.contains("Só bloquear"))).sum()),
+        "so_bloqueio": int((res.eq("BLOQUEADA") | (res.eq("SIMULADO") & df["Acao"].eq("Bloquear login"))).sum()),
         "mantidas": int((res.eq("CONVERTIDA") | (res.eq("SIMULADO") & det.str.contains("MANTIDA"))).sum()),
         "protegidas": int((res.eq("PULADA") & det.str.contains("Atividade recente")).sum()),
         "erros": int(res.eq("ERRO").sum()),
@@ -244,10 +244,11 @@ def enviar_email_resumo(token, remetente, destinatario, caminho_arquivo, df_fina
     if total_candidatas == 0:
         assunto = f"{prefixo}Automação M365: 0 caixas inativas para processar"
     elif contagens:
-        if dry_run:
-            partes = [f"{contagens['licencas']} licenças seriam recuperadas", f"{contagens['so_bloqueio']} só bloqueio"]
-        else:
-            partes = [f"{contagens['licencas']} licenças recuperadas", f"{contagens['so_bloqueio']} bloqueadas"]
+        partes = []
+        if contagens["licencas"] or not contagens["so_bloqueio"]:
+            partes.append(f"{contagens['licencas']} licenças " + ("seriam recuperadas" if dry_run else "recuperadas"))
+        if contagens["so_bloqueio"] or not partes:
+            partes.append(f"{contagens['so_bloqueio']} " + ("só bloqueio" if dry_run else "bloqueadas"))
         if contagens["protegidas"]:
             partes.append(f"{contagens['protegidas']} protegidas por atividade recente")
         if contagens["erros"]:

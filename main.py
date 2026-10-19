@@ -5,7 +5,8 @@ from core.graph_relatorio_email import (
 from core.extracao_tipos_caixa import atualizar_tipos_caixa
 from core.classificacao_contas import gerar_relatorio_inativos
 from core.bloqueio_login import processar_bloqueios
-from core.conversao_e_licenca import processar_fase2
+from core.conversao_e_licenca import processar_fase2, aplicar_trava_fase1
+import pandas as pd
 from dotenv import load_dotenv, find_dotenv
 from datetime import datetime
 import os
@@ -116,10 +117,15 @@ def main():
                     dry_run=DRY_RUN, limite_max=LIMITE_MAX, lote=LOTE,
                 )
             else:
+                # Fase 1: antes de bloquear qualquer login, a trava lê o Exchange e separa quem tem atividade recente
+                df_para_bloquear, df_trava = aplicar_trava_fase1(token, df_resultado, limite_max=LIMITE_MAX)
                 df_bloqueios = processar_bloqueios(
-                    token, df_resultado,
+                    token, df_para_bloquear,
                     dry_run=DRY_RUN, limite_max=LIMITE_MAX, lote=LOTE,
                 )
+                partes = [d for d in (df_trava, df_bloqueios) if not d.empty]
+                if partes:
+                    df_bloqueios = pd.concat(partes, ignore_index=True)
             if not df_bloqueios.empty:
                 caminho_bloqueios = f"relatorios/Bloqueios_{datetime.now():%Y%m%d_%H%M}.csv"
                 os.makedirs("relatorios", exist_ok=True)
